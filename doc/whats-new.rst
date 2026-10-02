@@ -37,12 +37,19 @@ New Features
   velocity and residence time in SI units, consumed by the particle
   tracker in the ``fluvial-particle`` package. When a segment shapefile
   is supplied, it must use a projected CRS in meters, raising if it does
-  not and warning if the shapefile carries no CRS at all. Helpers
+  not or carries no CRS at all. Helpers
   :func:`~pywatershed.utils.shear_velocity` and
   :func:`~pywatershed.utils.calculate_seg_mid_elevations` (the latter
-  refactored out of :class:`MmrToMf6Dfw`, behavior unchanged; its debug
+  refactored out of :class:`MmrToMf6Dfw`, numerics unchanged, now
+  validating ``tosegment`` and detecting cycles, on which the old loop ran
+  forever; its debug
   ``check=True`` path, previously non-functional, now verifies the interior
-  and outlet elevation invariants and raises on failure) are public. The
+  and outlet elevation invariants and raises on failure) are public. Both
+  now read the ``elev_units`` parameter, converting ``hru_elev`` from feet
+  when it is 0 and raising when it is absent (previously ``hru_elev`` was
+  assumed to be in meters), and an outlet segment with no HRU draining to
+  it (common in NHM subsets, e.g. ``ucb_2yr``) takes its elevation from the
+  nearest upstream HRUs with a warning instead of crashing. The
   exporter validates its inputs up front: required parameters, ``tosegment``
   range and cycles, each run file's ``nhm_seg`` order, shared time axis and
   ``units`` against the pywatershed metadata, and the requested time

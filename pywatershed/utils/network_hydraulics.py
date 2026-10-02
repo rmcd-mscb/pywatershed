@@ -16,6 +16,7 @@ import xarray as xr
 
 from ..base import meta
 from ..base.parameters import Parameters
+from ..constants import meters_per_foot
 from ..hydrology.prms_hydraulic_geometry import CFS_TO_CMS
 from ..version import __version__
 
@@ -37,14 +38,17 @@ def shear_velocity(depth: np.ndarray, slope: np.ndarray) -> np.ndarray:
         Shear velocity (m/s), same shape as the broadcast of the inputs.
 
     Raises:
-        ValueError: any slope is negative or not finite.
+        ValueError: any depth or slope is negative or not finite.
     """
+    depth = np.asarray(depth, dtype=float)
     slope = np.asarray(slope, dtype=float)
-    n_bad = int(np.sum(~(np.isfinite(slope) & (slope >= 0.0))))
-    if n_bad:
-        raise ValueError(
-            f"slope must be non-negative and finite; {n_bad} value(s) are not"
-        )
+    for name, values in (("depth", depth), ("slope", slope)):
+        n_bad = int(np.sum(~(np.isfinite(values) & (values >= 0.0))))
+        if n_bad:
+            raise ValueError(
+                f"{name} must be non-negative and finite; {n_bad} value(s) "
+                "are not"
+            )
     slope_floored = np.maximum(slope, SLOPE_FLOOR)
     return np.sqrt(G * np.asarray(depth, dtype=float) * slope_floored)
 
@@ -77,16 +81,101 @@ def _validate_tosegment(tosegment: np.ndarray) -> np.ndarray:
     return values.astype(np.int64) - 1
 
 
+def _hru_elev_meters(parameters: Parameters) -> np.ndarray:
+    """``hru_elev`` in meters, converted from feet when ``elev_units`` is 0.
+
+    Args:
+        parameters: a Parameters object with ``hru_elev`` and the PRMS
+            ``elev_units`` flag (0 = feet, 1 = meters).
+
+    Returns:
+        A new array of HRU elevations in meters.
+
+    Raises:
+        ValueError: ``elev_units`` is missing or not 0 or 1.
+    """
+    params = parameters.parameters
+    if "elev_units" not in params:
+        raise ValueError(
+            "elev_units is required to interpret hru_elev "
+            "(0 = feet, 1 = meters)"
+        )
+    elev_units = np.asarray(params["elev_units"]).ravel()
+    if elev_units.size != 1 or elev_units[0] not in (0, 1):
+        raise ValueError(
+            f"elev_units must be the scalar 0 (feet) or 1 (meters); got "
+            f"{params['elev_units']}"
+        )
+    hru_elev = np.asarray(params["hru_elev"], dtype=float)
+    if elev_units[0] == 0:
+        return hru_elev * meters_per_foot
+    return hru_elev.copy()
+
+
+def _outlet_elevation(
+    outlet: int,
+    tosegment0: np.ndarray,
+    hru_seg: np.ndarray,
+    hru_elev: np.ndarray,
+    seg_dy: np.ndarray,
+) -> float:
+    """Elevation (m) of an outlet segment's downstream end.
+
+    The lowest ``hru_elev`` of the HRUs draining to the outlet. When no
+    HRU drains to it (common for NHM subsets), the nearest upstream
+    segments with HRUs stand in: each takes its own lowest HRU elevation
+    at its downstream end, less the rise of the segments between it and
+    the outlet's downstream end; the lowest result is used and a warning
+    names the outlet.
+
+    Raises:
+        ValueError: no HRU drains to the outlet or to any segment
+            upstream of it.
+    """
+    own = hru_elev[hru_seg == outlet]
+    if own.size:
+        return float(own.min())
+    # breadth-first upstream; drop[s] is the rise from the outlet's
+    # downstream end to s's downstream end
+    drop = {outlet: 0.0}
+    frontier = [outlet]
+    while frontier:
+        next_frontier = []
+        for down in frontier:
+            for up in np.where(tosegment0 == down)[0]:
+                drop[int(up)] = drop[down] + seg_dy[down]
+                next_frontier.append(int(up))
+        candidates = [
+            float(hru_elev[hru_seg == ss].min() - drop[ss])
+            for ss in next_frontier
+            if (hru_seg == ss).any()
+        ]
+        if candidates:
+            warn(
+                f"Outlet segment index {outlet} has no HRU draining to "
+                "it; its downstream elevation is taken from the HRUs of "
+                f"the nearest upstream segments {next_frontier}"
+            )
+            return min(candidates)
+        frontier = next_frontier
+    raise ValueError(
+        f"Outlet segment index {outlet} has no HRU draining to it or to "
+        "any segment upstream of it; check hru_segment"
+    )
+
+
 def calculate_seg_mid_elevations(
     parameters: Parameters,
 ) -> tuple[np.ndarray, dict[int, float]]:
     """Elevation at the midpoint of each segment, walked up from outlets.
 
     Each outlet's downstream end takes the lowest elevation of the HRUs
-    that drain to it; every segment's upstream end is its downstream
-    end plus ``seg_slope * seg_length``; the midpoint is the mean of the
-    two. Requires ``tosegment``, ``seg_slope``, ``seg_length``,
-    ``hru_segment`` and ``hru_elev``.
+    that drain to it (or, with a warning, of the nearest upstream
+    segments' HRUs when none do); every segment's upstream end is its
+    downstream end plus ``seg_slope * seg_length``; the midpoint is the
+    mean of the two. Requires ``tosegment``, ``seg_slope``,
+    ``seg_length``, ``hru_segment``, ``hru_elev`` and ``elev_units``;
+    ``hru_elev`` is converted to meters when ``elev_units`` is 0 (feet).
 
     Args:
         parameters: a Parameters object with the parameters above.
@@ -97,16 +186,30 @@ def calculate_seg_mid_elevations(
         zero-based segment index to its midpoint elevation (m).
 
     Raises:
-        ValueError: ``tosegment`` is out of range or contains a cycle.
+        KeyError: a required parameter is missing.
+        ValueError: ``tosegment`` is out of range or contains a cycle,
+            ``elev_units`` is missing or not 0 or 1, an outlet has no
+            HRU draining to it or to anything upstream of it, or
+            ``seg_slope``, ``seg_length`` or ``hru_elev`` has a non-finite
+            value.
+
+    Warns:
+        UserWarning: an outlet has no HRU draining to it.
     """
     params = parameters.parameters
+    for name in ("seg_slope", "seg_length", "hru_elev"):
+        bad = np.where(~np.isfinite(np.asarray(params[name], dtype=float)))[0]
+        if bad.size:
+            raise ValueError(
+                f"{name} has non-finite values at indices {bad.tolist()}"
+            )
     seg_dy = params["seg_slope"] * params["seg_length"]
     nseg = len(seg_dy)
     seg_y = np.full(nseg, np.nan)  # elevation at the upstream end
     tosegment0 = _validate_tosegment(params["tosegment"])
     is_outflow = -1
     hru_seg = params["hru_segment"] - 1
-    hru_elev = params["hru_elev"]
+    hru_elev = _hru_elev_meters(parameters)
     outlet_mid = {}
 
     for ss in range(nseg):
@@ -127,8 +230,9 @@ def calculate_seg_mid_elevations(
         for seg in reversed(chain):
             down = tosegment0[seg]
             if down == is_outflow:
-                outlet_hrus = np.where(hru_seg == seg)
-                outlet_elev = hru_elev[outlet_hrus].min()
+                outlet_elev = _outlet_elevation(
+                    seg, tosegment0, hru_seg, hru_elev, seg_dy
+                )
                 seg_y[seg] = seg_dy[seg] + outlet_elev
                 outlet_mid[int(seg)] = float(seg_y[seg] - seg_dy[seg] / 2)
             else:
@@ -147,6 +251,7 @@ _REQUIRED_PARAMS = (
     "seg_depth",
     "hru_segment",
     "hru_elev",
+    "elev_units",
 )
 """Parameters the exporter requires."""
 
@@ -160,12 +265,22 @@ REQUIRED_RUN_VARS = (
 )
 """Output variables the exporter requires in ``run_dir``."""
 
+_REFERENCE_RUN_VAR = REQUIRED_RUN_VARS[0]
+"""The run file whose time axis the others must match."""
+
 OPTIONAL_RUN_VARS = ("seg_tave_water",)
 """Output variables the exporter includes when present in ``run_dir``."""
 
 _GEOMETRY_METHOD = "power_law_at_a_station"
+"""The functional form of the geometry process, ``alpha * Q**m`` with
+per-reach ``alpha`` and ``m`` (at-a-station hydraulic geometry); it does
+not say how the parameters were set (``at_a_station_hydraulic_geometry``
+or the parameter file)."""
 
-_ZERO_FLOW_NOTE = "0 where flow_out == 0; mask on flow_out > 0"
+_ZERO_FLOW_NOTE = (
+    "0 where flow_out == 0; velocity is also 0 where width*depth <= 1e-6 "
+    "m2; mask on flow_out > 0"
+)
 
 _ZERO_FLOW_VARS = ("velocity", "depth", "width", "residence_time")
 
@@ -240,7 +355,7 @@ def _read_run_vars(
     if start_time is not None and end_time is not None:
         if start_time > end_time:
             raise ValueError("start_time is after end_time")
-    # seg_outflow is first, so its time axis is the reference for the rest
+    # _REFERENCE_RUN_VAR is read first; its time axis is the reference
     names = list(REQUIRED_RUN_VARS) + [
         nm for nm in OPTIONAL_RUN_VARS if (run_dir / f"{nm}.nc").exists()
     ]
@@ -248,51 +363,110 @@ def _read_run_vars(
     reference_time = None
     for nm in names:
         path = run_dir / f"{nm}.nc"
-        with xr.open_dataarray(path) as opened:
-            da = opened.load()
-        if "nhm_seg" not in da.coords:
-            raise ValueError(
-                f"{nm}.nc has no nhm_seg coordinate; cannot verify reach order"
-            )
-        if not np.array_equal(da["nhm_seg"].values, reach_id):
-            raise ValueError(
-                f"{nm}.nc coordinate nhm_seg does not match the "
-                "parameters' nhm_seg order"
-            )
-        available = da["time"].values
-        if reference_time is None:
-            reference_time = available
-        elif not np.array_equal(available, reference_time):
-            raise ValueError(
-                f"{nm}.nc time coordinate does not match seg_outflow.nc; "
-                "run outputs must share one time axis"
-            )
-        expected_units = meta.get_vars(nm)[nm]["units"]
-        units = da.attrs.get("units")
-        if units is None:
-            warn(
-                f"{nm}.nc has no units attribute; assuming '{expected_units}'"
-            )
-        elif units != expected_units:
-            raise ValueError(
-                f"{nm}.nc units '{units}' differ from expected "
-                f"'{expected_units}'"
-            )
-        if start_time is not None or end_time is not None:
-            da = da.sel(time=slice(start_time, end_time))
-            if da.sizes["time"] == 0:
-                if len(available):
-                    span = (
-                        f"its times run from {available[0]} to {available[-1]}"
-                    )
-                else:
-                    span = "the file has no time steps at all"
+        # validate coordinates and attributes lazily, load only the
+        # selected time window
+        with xr.open_dataarray(path) as da:
+            if "nhm_seg" not in da.coords:
                 raise ValueError(
-                    f"{nm}.nc has no time steps between start_time "
-                    f"{start_time} and end_time {end_time}; {span}"
+                    f"{nm}.nc has no nhm_seg coordinate; cannot verify "
+                    "reach order"
                 )
-        result[nm] = da
+            if not np.array_equal(da["nhm_seg"].values, reach_id):
+                raise ValueError(
+                    f"{nm}.nc coordinate nhm_seg does not match the "
+                    "parameters' nhm_seg order"
+                )
+            available = da["time"].values
+            if reference_time is None:
+                reference_time = available
+            elif not np.array_equal(available, reference_time):
+                raise ValueError(
+                    f"{nm}.nc time coordinate does not match "
+                    f"{_REFERENCE_RUN_VAR}.nc; run outputs must share one "
+                    "time axis"
+                )
+            expected_units = meta.get_vars(nm)[nm]["units"]
+            units = da.attrs.get("units")
+            if units is None:
+                raise ValueError(
+                    f"{nm}.nc has no units attribute; expected "
+                    f"'{expected_units}' (pywatershed output always carries "
+                    "units, so this file was written or edited elsewhere)"
+                )
+            if units != expected_units:
+                raise ValueError(
+                    f"{nm}.nc units '{units}' differ from expected "
+                    f"'{expected_units}'"
+                )
+            if start_time is not None or end_time is not None:
+                _check_time_window(nm, available, start_time, end_time)
+                da = da.sel(time=slice(start_time, end_time))
+            if da.dims != ("time", "nhm_seg"):
+                raise ValueError(
+                    f"{nm}.nc has dims {da.dims}; expected ('time', 'nhm_seg')"
+                )
+            result[nm] = da.load()
+        _check_run_values(nm, result[nm])
     return result
+
+
+def _check_run_values(name: str, da: xr.DataArray) -> None:
+    """Raise on non-finite values, or negative ones for the flow and
+    geometry variables (water temperature may be negative)."""
+    values = np.asarray(da.values, dtype=float)
+    bad = ~np.isfinite(values)
+    what = "non-finite"
+    if name in REQUIRED_RUN_VARS:
+        bad |= values < 0.0
+        what = "non-finite or negative"
+    if bad.any():
+        first = np.argwhere(bad)[0]
+        where = ", ".join(
+            f"{dim}={da[dim].values[idx]}" for dim, idx in zip(da.dims, first)
+        )
+        raise ValueError(
+            f"{name}.nc has {int(bad.sum())} {what} value(s), first at "
+            f"{where}; a run that stopped early leaves fill values"
+        )
+
+
+def _check_static_params(params: dict) -> None:
+    """Raise unless the per-segment parameters written to the file have
+    usable values (consumers scale distances by ``length``)."""
+    for name in ("seg_length", "mann_n", "seg_width", "seg_depth"):
+        values = np.asarray(params[name], dtype=float)
+        bad = np.where(~(np.isfinite(values) & (values > 0.0)))[0]
+        if bad.size:
+            raise ValueError(
+                f"{name} must be positive and finite; bad at segment "
+                f"indices {bad.tolist()}"
+            )
+    slope = np.asarray(params["seg_slope"], dtype=float)
+    bad = np.where(~(np.isfinite(slope) & (slope >= 0.0)))[0]
+    if bad.size:
+        raise ValueError(
+            "seg_slope must be non-negative and finite; bad at segment "
+            f"indices {bad.tolist()}"
+        )
+
+
+def _check_time_window(name: str, available, start_time, end_time) -> None:
+    """Raise unless ``start_time``/``end_time`` select a non-empty part of
+    ``available`` without reaching outside it (no silent clipping)."""
+    if not len(available):
+        raise ValueError(f"{name}.nc has no time steps at all")
+    span = f"{name}.nc times run from {available[0]} to {available[-1]}"
+    if start_time is not None and np.datetime64(start_time) < available[0]:
+        raise ValueError(f"start_time {start_time} is before the run; {span}")
+    if end_time is not None and np.datetime64(end_time) > available[-1]:
+        raise ValueError(f"end_time {end_time} is after the run; {span}")
+    lo = available[0] if start_time is None else np.datetime64(start_time)
+    hi = available[-1] if end_time is None else np.datetime64(end_time)
+    if not ((available >= lo) & (available <= hi)).any():
+        raise ValueError(
+            f"{name}.nc has no time steps between start_time {start_time} "
+            f"and end_time {end_time}; {span}"
+        )
 
 
 def export_network_hydraulics(
@@ -310,21 +484,28 @@ def export_network_hydraulics(
     The file carries reach topology, optional planform polylines, and
     per-reach time series of flow, velocity, depth, width, shear
     velocity and residence time in SI units, for consumers such as 1D
-    network particle trackers. Hydraulics are taken from the
-    :class:`PRMSHydraulicGeometryFull` outputs in ``run_dir``; only shear
-    velocity is computed here.
+    network particle trackers. Flows are read from the
+    :class:`PRMSChannel` outputs and converted from cfs; velocity,
+    depth, width and residence time are read from the hydraulic
+    geometry process outputs (:class:`PRMSHydraulicGeometryFull` or
+    :class:`PRMSHydraulicGeometryWidthOnly`); water temperature, when
+    present, from the stream temperature process; only shear velocity
+    is computed here.
 
     Where ``flow_out`` is 0 the process outputs give ``velocity``,
-    ``depth``, ``width`` and ``residence_time`` of 0 (not inf);
-    consumers should mask on ``flow_out > 0``.
+    ``depth``, ``width`` and ``residence_time`` of 0 (not inf); velocity
+    is also 0 where the flow area ``width * depth`` is at most 1e-6 m^2
+    even though ``flow_out``, ``residence_time`` and ``ustar`` are not.
+    Consumers should mask on ``flow_out > 0``.
 
     Args:
         parameters: the run's parameters (needs ``nhm_seg``,
             ``tosegment``, ``seg_length``, ``seg_slope``, ``mann_n``,
-            ``seg_width``, ``seg_depth``, ``hru_segment``,
-            ``hru_elev``). ``tosegment_nhm`` is used for ``to_id`` when
-            present; otherwise ``to_id`` is derived from ``tosegment``
-            and ``nhm_seg``.
+            ``seg_width``, ``seg_depth``, ``hru_segment``, ``hru_elev``
+            and ``elev_units``). ``tosegment_nhm`` is used for ``to_id``
+            when present and must agree with ``tosegment`` and
+            ``nhm_seg`` away from outlets; otherwise ``to_id`` is derived
+            from ``tosegment`` and ``nhm_seg``.
         run_dir: pywatershed NetCDF output directory containing
             ``seg_outflow``, ``seg_inflow``, ``seg_flow_width``,
             ``seg_flow_depth``, ``seg_flow_velocity`` and ``seg_res_time``
@@ -332,10 +513,11 @@ def export_network_hydraulics(
         out_file: path of the NetCDF file to write.
         segment_shp_file: optional shapefile of segment LineStrings; adds
             the ``vertex`` block and reach midpoints. Must use a
-            projected CRS in meters: a geographic CRS or a projected
-            CRS not in meters raises ``ValueError``; a missing CRS
-            warns and coordinates are labeled with units "unknown".
-            Each line is oriented so its downstream end is last. For a
+            projected CRS in meters: a missing CRS, a geographic CRS or
+            a projected CRS not in meters raises ``ValueError``.
+            Each line is oriented so its downstream end is last (except
+            an outlet with no upstream reach, which is left as read with
+            a warning). For a
             reach with a downstream neighbor, the line is reversed
             when its first vertex is nearer than its last vertex to
             the downstream reach's nearest end. For an outlet reach
@@ -366,16 +548,35 @@ def export_network_hydraulics(
         FileNotFoundError: a required output file is missing from
             ``run_dir``; all missing names are listed.
         ValueError: a required parameter is missing; ``tosegment`` is
-            out of range or contains a cycle; a run file has no
+            out of range or contains a cycle; ``tosegment_nhm`` disagrees
+            with ``tosegment`` and ``nhm_seg``; ``seg_length``,
+            ``mann_n``, ``seg_width`` or ``seg_depth`` is not positive
+            and finite, or ``seg_slope`` is negative or not finite;
+            ``elev_units`` is missing or not 0 or 1; an outlet has no HRU
+            draining to it or to anything upstream; a run file has no
             ``nhm_seg`` coordinate or its order does not match the
             parameters; run files do not share one time axis; a run
-            file's ``units`` attribute differs from the pywatershed
-            metadata; the requested time selection is empty or
-            ``start_time`` is after ``end_time``; the shapefile
+            file has no ``units`` attribute or it differs from the
+            pywatershed metadata; a run file holds non-finite values, or
+            negative ones other than water temperature;
+            ``start_time`` or ``end_time`` falls outside the
+            run's time span, selects no time steps, or ``start_time`` is
+            after ``end_time``; the shapefile
             identifiers do not match ``nhm_seg``; a shapefile geometry
-            is not a ``LineString``; the shapefile CRS is geographic or
-            not in meters; or more than half of the reaches with a
-            downstream reach fail ``connect_tol``.
+            is not a ``LineString``, is null or empty, or has zero
+            length; ``shp_id_col`` is not a column of the shapefile or
+            holds non-integer values; a run file's dims are not
+            ``(time, nhm_seg)``; the shapefile has no CRS, or its CRS is
+            geographic or not in meters; or more than half of the
+            reaches with a downstream reach fail ``connect_tol``.
+        ImportError: ``segment_shp_file`` is given and geopandas is not
+            installed.
+
+    Warns:
+        UserWarning: an outlet has no HRU draining to it (elevation taken
+            from upstream HRUs); an outlet reach's polyline has no
+            upstream reach to orient it by; or some (at most half) of the
+            reach polylines fail ``connect_tol``.
     """
     params = parameters.parameters
     missing_params = [nm for nm in _REQUIRED_PARAMS if nm not in params]
@@ -384,20 +585,33 @@ def export_network_hydraulics(
             "export_network_hydraulics requires parameters "
             f"{list(_REQUIRED_PARAMS)}; missing {missing_params}"
         )
+    _check_static_params(params)
     reach_id = np.asarray(params["nhm_seg"], dtype=np.int64)
     to_index = _validate_tosegment(params["tosegment"]).astype(np.int32)
     is_outlet = (to_index < 0).astype(np.int8)
     elevation_mid, _ = calculate_seg_mid_elevations(parameters)
+    interior = to_index >= 0
+    to_id_derived = reach_id[np.maximum(to_index, 0)]
     if "tosegment_nhm" in params:
         to_id = np.asarray(params["tosegment_nhm"], dtype=np.int64)
         to_id_source = "tosegment_nhm"
+        # one file must not carry two topologies: to_id (from
+        # tosegment_nhm) and to_index (from tosegment) must agree
+        bad = np.where(interior & (to_id != to_id_derived))[0]
+        if bad.size:
+            raise ValueError(
+                "tosegment_nhm disagrees with tosegment and nhm_seg at "
+                f"segment indices {bad.tolist()}: tosegment_nhm gives "
+                f"{to_id[bad].tolist()}, tosegment gives "
+                f"{to_id_derived[bad].tolist()}"
+            )
     else:
-        to_id = reach_id[np.maximum(to_index, 0)]
+        to_id = to_id_derived
         to_id_source = "derived from tosegment and nhm_seg"
-    to_id = np.where(to_index >= 0, to_id, 0)
+    to_id = np.where(interior, to_id, 0)
 
     run_vars = _read_run_vars(run_dir, reach_id, start_time, end_time)
-    time = run_vars["seg_outflow"]["time"].values
+    time = run_vars[_REFERENCE_RUN_VAR]["time"].values
 
     def static(values, dtype, units, long_name, source_name):
         return xr.DataArray(
@@ -446,7 +660,7 @@ def export_network_hydraulics(
             params["seg_slope"],
             np.float64,
             "m m-1",
-            "reach slope",
+            "reach slope (unfloored; ustar uses max(slope, 1e-7))",
             "seg_slope",
         ),
         "mann_n": static(
@@ -461,7 +675,7 @@ def export_network_hydraulics(
             np.float64,
             "m",
             "elevation at the reach midpoint, walked up from outlets",
-            "seg_slope*seg_length, hru_elev",
+            "tosegment, hru_segment, hru_elev, seg_slope*seg_length",
         ),
         "bankfull_width": static(
             params["seg_width"],
@@ -502,7 +716,7 @@ def export_network_hydraulics(
             "units": "m s-1",
             "long_name": "shear velocity",
             "source_name": "seg_flow_depth, seg_slope",
-            "method": "sqrt(g*depth*slope)",
+            "method": "sqrt(g*depth*max(slope, 1e-7))",
         },
     )
 
@@ -530,28 +744,29 @@ def export_network_hydraulics(
             "connect_tol": float(connect_tol),
             "crs_wkt": crs_wkt,
             "conventions_note": (
-                "Particle state is (reach index, s) with 0 <= s <= length "
-                "from the reach's upstream end. When s exceeds length the "
-                "particle moves to to_index carrying the unused fraction of "
-                "the time step; to_index == -1 is an outlet. Map position "
-                "scales s/length onto the polyline's vertex_dist. "
+                "Reach position is (reach index, s) with 0 <= s <= length "
+                "measured from the reach's upstream end; water leaving the "
+                "downstream end enters to_index, and to_index == -1 is an "
+                "outlet. Map position scales s/length onto the polyline's "
+                "vertex_dist. "
                 "Where flow_out is 0 the velocity, depth, width and "
-                "residence_time are 0 (not inf); mask on flow_out > 0. "
+                "residence_time are 0 (not inf); velocity is also 0 where "
+                "width*depth <= 1e-6 m2; mask on flow_out > 0. "
                 "n_unconnected is the number of reaches whose polyline end "
                 "does not meet the downstream reach within connect_tol "
                 "(-1 when no polyline block)."
             ),
         },
     )
-    out_file = pl.Path(out_file)
-    ds.to_netcdf(out_file)
-    ds.close()
     if n_unconnected > 0:
         warn(
             f"{n_unconnected} reach polyline(s) do not meet their "
             f"downstream reach within {connect_tol}; see the "
             "n_unconnected global attribute"
         )
+    out_file = pl.Path(out_file)
+    ds.to_netcdf(out_file)
+    ds.close()
     return out_file
 
 
@@ -568,44 +783,62 @@ def _polyline_block(
             f"Column {shp_id_col} not in {segment_shp_file}; "
             f"columns are {list(gdf.columns)}"
         )
-    shp_ids = gdf[shp_id_col].to_numpy().astype(np.int64)
+    raw_ids = gdf[shp_id_col].to_numpy()
+    try:
+        as_float = raw_ids.astype(float)
+    except (TypeError, ValueError) as err:
+        raise ValueError(
+            f"Shapefile column {shp_id_col} must hold integer identifiers; "
+            f"got dtype {raw_ids.dtype}"
+        ) from err
+    if not np.all(np.isfinite(as_float) & (as_float == np.floor(as_float))):
+        raise ValueError(
+            f"Shapefile column {shp_id_col} must hold integer identifiers; "
+            "some values are fractional or missing"
+        )
+    shp_ids = as_float.astype(np.int64)
     if set(shp_ids) != set(reach_id) or len(shp_ids) != len(reach_id):
         raise ValueError(
             f"Shapefile column {shp_id_col} identifiers do not match the "
             "parameters' nhm_seg identifiers"
         )
     if gdf.crs is None:
-        crs_units = "unknown"
-        crs_wkt = ""
-        warn(
-            "Segment shapefile has no CRS; coordinates are assumed to be "
-            "in meters"
+        raise ValueError(
+            f"Segment shapefile {segment_shp_file} has no CRS (missing or "
+            "empty .prj); the segment shapefile must use a projected CRS "
+            "in meters, so set its CRS before exporting"
         )
-    elif gdf.crs.is_geographic:
+    if gdf.crs.is_geographic:
         raise ValueError(
             f"Segment shapefile CRS {gdf.crs.name!r} is geographic; the "
             "segment shapefile must use a projected CRS in meters "
             "(for example, reproject to EPSG:5070)"
         )
-    else:
-        unit_name = gdf.crs.axis_info[0].unit_name
-        if unit_name not in ("metre", "meter", "m"):
-            raise ValueError(
-                f"Segment shapefile CRS {gdf.crs.name!r} uses units "
-                f"{unit_name!r}; the segment shapefile must use a "
-                "projected CRS in meters"
-            )
-        crs_units = "m"
-        crs_wkt = gdf.crs.to_wkt()
+    unit_name = gdf.crs.axis_info[0].unit_name
+    if unit_name not in ("metre", "meter", "m"):
+        raise ValueError(
+            f"Segment shapefile CRS {gdf.crs.name!r} uses units "
+            f"{unit_name!r}; the segment shapefile must use a "
+            "projected CRS in meters"
+        )
+    crs_units = "m"
+    crs_wkt = gdf.crs.to_wkt()
 
     order = {rid: ii for ii, rid in enumerate(shp_ids)}
     geoms = [gdf.geometry.iloc[order[rid]] for rid in reach_id]
     coords = []
     for rid, gg in zip(reach_id, geoms):
+        if gg is None or gg.is_empty:
+            raise ValueError(f"Reach {rid} has a null or empty geometry")
         if gg.geom_type != "LineString":
             raise ValueError(
                 f"Reach {rid} geometry is {gg.geom_type}; only LineString "
                 "is supported (explode or merge multipart segments first)"
+            )
+        if gg.length == 0.0:
+            raise ValueError(
+                f"Reach {rid} polyline has zero length; particle positions "
+                "scale s/length onto it, so it cannot be used"
             )
         coords.append(np.asarray(gg.coords, dtype=float)[:, :2])
 
@@ -672,12 +905,9 @@ def _polyline_block(
         step = np.hypot(np.diff(cc[:, 0]), np.diff(cc[:, 1]))
         dist = np.concatenate([[0.0], np.cumsum(step)])
         dists.append(dist)
-        if dist[-1] == 0:
-            x_mid[ii], y_mid[ii] = cc[0, 0], cc[0, 1]
-        else:
-            half = dist[-1] / 2.0
-            x_mid[ii] = np.interp(half, dist, cc[:, 0])
-            y_mid[ii] = np.interp(half, dist, cc[:, 1])
+        half = dist[-1] / 2.0
+        x_mid[ii] = np.interp(half, dist, cc[:, 0])
+        y_mid[ii] = np.interp(half, dist, cc[:, 1])
     vertex_dist = np.concatenate(dists)
 
     def vvar(values, dims, units, long_name):

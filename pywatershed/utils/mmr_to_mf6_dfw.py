@@ -1,4 +1,5 @@
 import pathlib as pl
+import warnings
 from warnings import warn
 
 import numpy as np
@@ -8,7 +9,11 @@ from pywatershed import Control, meta
 
 from ..constants import fileish, zero
 from ..parameters import PrmsParameters
-from .network_hydraulics import calculate_seg_mid_elevations
+from .network_hydraulics import (
+    _hru_elev_meters,
+    _outlet_elevation,
+    calculate_seg_mid_elevations,
+)
 from .optional_import import import_optional_dependency
 
 flopy = import_optional_dependency("flopy", errors="ignore")
@@ -76,8 +81,8 @@ class MmrToMf6Dfw:
         segments.
     * hru_elev:
         Used to calculate seg_mid_elevation if not present in parameters. See
-        its description below. Units are in meters (though not documented in
-        the metadata as such, just "elev_units")
+        its description below. Converted to meters when the "elev_units"
+        parameter is 0 (feet); "elev_units" must be present.
     * seg_width:
         This is (apparently) the NHD bank-full width present in the PRMS
         parameter files but unused in PRMS. Units are in meters.
@@ -814,15 +819,20 @@ class MmrToMf6Dfw:
             seg_dy = params["seg_slope"] * params["seg_length"]
             tosegment0 = params["tosegment"] - 1
             hru_seg0 = params["hru_segment"] - 1
-            hru_elev = params["hru_elev"]
+            hru_elev = _hru_elev_meters(self.parameters)
             for ss in range(len(seg_dy)):
                 down = tosegment0[ss]
                 if down == -1:
                     # an outlet's downstream end is the lowest elevation
-                    # of the HRUs draining to it
+                    # of the HRUs draining to it (or, lacking any, of the
+                    # nearest upstream HRUs less the intervening rise)
                     down_end = mid[ss] - seg_dy[ss] / 2
-                    outlet_elev = hru_elev[np.where(hru_seg0 == ss)].min()
-                    if abs(down_end - outlet_elev) >= 1.0e-7:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        outlet_elev = _outlet_elevation(
+                            ss, tosegment0, hru_seg0, hru_elev, seg_dy
+                        )
+                    if not abs(down_end - outlet_elev) < 1.0e-7:
                         raise ValueError(
                             f"Outlet segment {ss} downstream elevation "
                             f"{down_end} does not equal the minimum "
@@ -832,7 +842,7 @@ class MmrToMf6Dfw:
                 # upstream end of ss equals upstream end of down + rise
                 up_ss = mid[ss] + seg_dy[ss] / 2
                 up_down = mid[down] + seg_dy[down] / 2
-                if abs((up_ss - up_down) - seg_dy[ss]) >= 1.0e-7:
+                if not abs((up_ss - up_down) - seg_dy[ss]) < 1.0e-7:
                     raise ValueError(
                         f"Segment {ss} upstream elevation {up_ss} is not "
                         f"its rise {seg_dy[ss]} above the upstream "

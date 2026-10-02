@@ -63,9 +63,20 @@ def at_a_station_hydraulic_geometry(
 
     Raises:
         ValueError: a required parameter is missing, ``seg_slope`` is
-            negative or not finite, or ``seg_width``, ``seg_depth`` or
-            ``mann_n`` is not positive.
+            negative or not finite, ``seg_width``, ``seg_depth`` or
+            ``mann_n`` is not positive, or ``width_exp`` and ``depth_exp``
+            are not both in ``[0, 1]`` with a sum of at most 1 (so the
+            implied velocity exponent is not negative).
     """
+    for name, value in (("width_exp", width_exp), ("depth_exp", depth_exp)):
+        if not (np.isfinite(value) and 0.0 <= value <= 1.0):
+            raise ValueError(f"{name} must be in [0, 1]; got {value}")
+    if width_exp + depth_exp > 1.0:
+        raise ValueError(
+            "width_exp + depth_exp must not exceed 1 (velocity exponent "
+            f"1 - width_exp - depth_exp would be negative); got {width_exp} "
+            f"+ {depth_exp}"
+        )
     params = parameters.parameters
     missing = [kk for kk in _REQUIRED if kk not in params]
     if missing:

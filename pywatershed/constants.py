@@ -103,6 +103,7 @@ var_type_to_numpy_type = {
 inch2cm = 2.54
 ft2_per_acre = 43560.0
 inches_per_foot = 12.0
+meters_per_foot = 0.3048
 cms_to_cfs = 35.314666721489
 cfs_to_cms = 1 / cms_to_cfs
 cm_to_cf = cms_to_cfs

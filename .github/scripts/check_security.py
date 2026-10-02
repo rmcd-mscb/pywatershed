@@ -320,7 +320,7 @@ class SecurityChecker:
                     # dict/list methods
                     r"\.(items|keys|values|get|pop|append|extend|update|copy)\b",
                     # pytest
-                    r"\.(main|raises|mark|fixture|skip"
+                    r"\.(main|raises|mark|fixture|skip|approx"
                     r"|warns|exitcode|fail|xfail|exit)\b",
                     # numpy/xarray testing
                     r"\.(assert|testing\.assert|allclose|array_equal)\b",

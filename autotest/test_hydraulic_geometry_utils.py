@@ -70,6 +70,9 @@ def test_at_a_station_hand_computed(synthetic_params):
         p["seg_width"], p["seg_depth"], p["seg_slope"], p["mann_n"]
     )
     np.testing.assert_allclose(bankfull["bankfull_flow"], q_bf, rtol=1e-12)
+    # one literal anchor so the test does not only mirror the formula:
+    # segment 0, w=5, d=0.5, s=0.01, n=0.04 -> area 2.5, R 0.41667
+    np.testing.assert_allclose(q_bf[0], 3.486629948344633, rtol=1e-12)
     np.testing.assert_allclose(
         bankfull["bankfull_velocity"],
         q_bf / (p["seg_width"] * p["seg_depth"]),
@@ -86,17 +89,17 @@ def test_at_a_station_hand_computed(synthetic_params):
     np.testing.assert_allclose(
         newp["depth_alpha"], p["seg_depth"] / q_bf**0.40, rtol=1e-12
     )
-    # the process formula (alpha * Q_cms ** m) returns bankfull geometry
-    np.testing.assert_allclose(
-        newp["width_alpha"] * q_bf ** newp["width_m"],
-        p["seg_width"],
-        rtol=1e-12,
-    )
-    np.testing.assert_allclose(
-        newp["depth_alpha"] * q_bf ** newp["depth_m"],
-        p["seg_depth"],
-        rtol=1e-12,
-    )
+    # the new parameters carry metadata on the segment dimension; the
+    # units are the registry's (parameters.yaml), which says "unknown" for
+    # width_m but "none" for depth_m
+    for name, units in (
+        ("width_alpha", "unknown"),
+        ("width_m", "unknown"),
+        ("depth_alpha", "meters"),
+        ("depth_m", "none"),
+    ):
+        assert new.metadata[name]["dims"] == ("nsegment",)
+        assert new.metadata[name]["attrs"]["units"] == units
     # the other parameters are carried over untouched
     np.testing.assert_array_equal(newp["seg_length"], p["seg_length"])
     assert new.dims["nsegment"] == NSEG
@@ -217,6 +220,26 @@ def test_at_a_station_negative_slope_raises(synthetic_params):
 
 
 @pytest.mark.domainless
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"width_exp": np.nan}, "width_exp must be in"),
+        ({"depth_exp": -0.1}, "depth_exp must be in"),
+        ({"width_exp": 1.2}, "width_exp must be in"),
+        # velocity exponent 1 - 0.6 - 0.6 would be negative
+        ({"width_exp": 0.6, "depth_exp": 0.6}, "must not exceed 1"),
+    ],
+)
+def test_at_a_station_bad_exponents_raise(synthetic_params, kwargs, match):
+    from pywatershed.utils.hydraulic_geometry import (
+        at_a_station_hydraulic_geometry,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        at_a_station_hydraulic_geometry(synthetic_params, **kwargs)
+
+
+@pytest.mark.domainless
 def test_at_a_station_missing_raises(synthetic_params):
     from pywatershed.utils.hydraulic_geometry import (
         at_a_station_hydraulic_geometry,
@@ -231,7 +254,17 @@ def test_at_a_station_missing_raises(synthetic_params):
 
 
 @pytest.mark.domainless
-def test_at_a_station_drb_bankfull_round_trip():
+def test_at_a_station_drb_through_process(synthetic_params):
+    """The derived parameters, fed to PRMSHydraulicGeometryFull's own
+    calculation with the bankfull flow in cfs (the process input unit),
+    reproduce the bankfull width and depth. This fails if either side
+    changes its flow unit or parameter names; the algebraic round trip
+    alpha * q**m == w cannot."""
+    import types
+
+    from pywatershed.hydrology.prms_hydraulic_geometry import (
+        PRMSHydraulicGeometryFull,
+    )
     from pywatershed.utils.hydraulic_geometry import (
         at_a_station_hydraulic_geometry,
     )
@@ -244,17 +277,27 @@ def test_at_a_station_drb_bankfull_round_trip():
         params, return_bankfull=True
     )
     assert isinstance(new, pws.parameters.PrmsParameters)
+    needed = set(PRMSHydraulicGeometryFull.get_parameters())
+    assert needed <= set(new.parameters)
     p = params.parameters
+    nseg = p["seg_width"].size
     q_cms = bankfull["bankfull_flow"]
-    # mirror PRMSHydraulicGeometryFull: flow_cms = seg_outflow_cfs * CFS_TO_CMS
-    q_cfs = q_cms / CFS_TO_CMS
-    flow_cms = q_cfs * CFS_TO_CMS
-    width = (
-        new.parameters["width_alpha"] * flow_cms ** new.parameters["width_m"]
-    )
-    depth = (
-        new.parameters["depth_alpha"] * flow_cms ** new.parameters["depth_m"]
-    )
-    np.testing.assert_allclose(width, p["seg_width"], rtol=1e-10)
-    np.testing.assert_allclose(depth, p["seg_depth"], rtol=1e-10)
     assert np.all(q_cms > 0)
+
+    # stand in for a process instance: its parameters plus the process's
+    # input (cfs) and output arrays
+    fake = types.SimpleNamespace(
+        **{name: new.parameters[name] for name in needed},
+        seg_outflow=q_cms / CFS_TO_CMS,
+        seg_flow_width=np.zeros(nseg),
+        seg_flow_depth=np.zeros(nseg),
+        seg_flow_area=np.zeros(nseg),
+        seg_flow_velocity=np.zeros(nseg),
+        seg_res_time=np.zeros(nseg),
+    )
+    PRMSHydraulicGeometryFull._compute_hydraulic_geometry(fake)
+    np.testing.assert_allclose(fake.seg_flow_width, p["seg_width"], rtol=1e-10)
+    np.testing.assert_allclose(fake.seg_flow_depth, p["seg_depth"], rtol=1e-10)
+    np.testing.assert_allclose(
+        fake.seg_flow_velocity, bankfull["bankfull_velocity"], rtol=1e-10
+    )
